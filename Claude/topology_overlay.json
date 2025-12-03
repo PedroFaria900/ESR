@@ -1,0 +1,159 @@
+{
+  "nodes": {
+    "n16": {
+      "id": "O1",
+      "node_name": "n16",
+      "ip": "10.0.16.10",
+      "port": 5000,
+      "role": "server",
+      "neighbors": ["n10"],
+      "description": "Servidor de streaming (bootstrapper)"
+    },
+    "n10": {
+      "id": "O2",
+      "node_name": "n10",
+      "ip": "10.0.16.1",
+      "port": 5000,
+      "role": "relay",
+      "neighbors": ["n16", "n5", "n6", "n7"],
+      "description": "Gateway principal - interface eth2 para switch n15"
+    },
+    "n6": {
+      "id": "O3",
+      "node_name": "n6",
+      "ip": "10.0.8.2",
+      "port": 5000,
+      "role": "relay",
+      "neighbors": ["n10", "n5", "n1"],
+      "description": "Relay direita - interface eth0 (menor IP)"
+    },
+    "n7": {
+      "id": "O4",
+      "node_name": "n7",
+      "ip": "10.0.17.1",
+      "port": 5000,
+      "role": "relay",
+      "neighbors": ["n10", "n1"],
+      "description": "Relay sul - interface eth4 para switch n13 (clientes n21, n22)"
+    },
+    "n5": {
+      "id": "O5",
+      "node_name": "n5",
+      "ip": "10.0.20.1",
+      "port": 5000,
+      "role": "relay",
+      "neighbors": ["n10", "n6", "n2"],
+      "description": "Relay centro-norte - interface eth4 para switch n14 (clientes n23, n24)"
+    },
+    "n2": {
+      "id": "O6",
+      "node_name": "n2",
+      "ip": "10.0.19.1",
+      "port": 5000,
+      "role": "relay",
+      "neighbors": ["n5","n1"],
+      "description": "Relay norte - interface eth3 para switch n11 (clientes n17, n18)"
+    },
+    "n1": {
+      "id": "O7",
+      "node_name": "n1",
+      "ip": "10.0.18.1",
+      "port": 5000,
+      "role": "relay",
+      "neighbors": ["n6", "n7","n2"],
+      "description": "Relay oeste - interface eth3 para switch n12 (clientes n19, n20)"
+    }
+  },
+  
+  "clients": {
+    "n17": {
+      "node_name": "n17",
+      "ip": "10.0.19.20",
+      "port": 5001,
+      "connects_to": "n2",
+      "overlay_node_ip": "10.0.19.1",
+      "description": "Cliente via switch n11"
+    },
+    "n18": {
+      "node_name": "n18",
+      "ip": "10.0.19.21",
+      "port": 5001,
+      "connects_to": "n2",
+      "overlay_node_ip": "10.0.19.1",
+      "description": "Cliente via switch n11"
+    },
+    "n19": {
+      "node_name": "n19",
+      "ip": "10.0.18.20",
+      "port": 5001,
+      "connects_to": "n1",
+      "overlay_node_ip": "10.0.18.1",
+      "description": "Cliente via switch n12"
+    },
+    "n20": {
+      "node_name": "n20",
+      "ip": "10.0.18.21",
+      "port": 5001,
+      "connects_to": "n1",
+      "overlay_node_ip": "10.0.18.1",
+      "description": "Cliente via switch n12"
+    },
+    "n21": {
+      "node_name": "n21",
+      "ip": "10.0.17.20",
+      "port": 5001,
+      "connects_to": "n7",
+      "overlay_node_ip": "10.0.17.1",
+      "description": "Cliente via switch n13"
+    },
+    "n22": {
+      "node_name": "n22",
+      "ip": "10.0.17.21",
+      "port": 5001,
+      "connects_to": "n7",
+      "overlay_node_ip": "10.0.17.1",
+      "description": "Cliente via switch n13"
+    },
+    "n23": {
+      "node_name": "n23",
+      "ip": "10.0.20.21",
+      "port": 5001,
+      "connects_to": "n5",
+      "overlay_node_ip": "10.0.20.1",
+      "description": "Cliente via switch n14"
+    },
+    "n24": {
+      "node_name": "n24",
+      "ip": "10.0.20.20",
+      "port": 5001,
+      "connects_to": "n5",
+      "overlay_node_ip": "10.0.20.1",
+      "description": "Cliente via switch n14"
+    },
+    "n25": {
+      "node_name": "n25",
+      "ip": "10.0.16.20",
+      "port": 5001,
+      "connects_to": "n10",
+      "overlay_node_ip": "10.0.16.1",
+      "description": "Cliente via switch n15"
+    }
+  },
+  
+  "config": {
+    "overlay_port": 5000,
+    "client_port": 5001,
+    "bootstrap_ip": "10.0.16.10",
+    "bootstrap_port": 5000,
+    "keepalive_interval": 10,
+    "route_announce_interval": 5,
+    "stream_id": "stream1"
+  },
+  
+  "topology_info": {
+    "total_overlay_nodes": 7,
+    "total_clients": 9,
+    "max_overlay_hops": 3,
+    "redundancy": "Cada nó tem 2-4 vizinhos"
+  }
+}
