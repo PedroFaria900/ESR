@@ -13,6 +13,8 @@ import threading
 import json
 import time
 import sys
+import cv2
+import numpy as np
 
 from protocol import *
 
@@ -36,6 +38,10 @@ class StreamingClient:
         self.frames_received = 0
         self.last_sequence = -1
         self.frames_lost = 0
+
+        # Socket UDP (Porta 5001)
+        self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_socket.bind(('0.0.0.0', 5001))
         
         print(f"[{self.client_id}] Cliente criado")
         print(f"[{self.client_id}] Overlay: {self.overlay_ip}:{self.overlay_port}")
@@ -45,6 +51,9 @@ class StreamingClient:
         """Inicia cliente"""
         self.running = True
         
+        # Inicia thread de recepção UDP
+        threading.Thread(target=self._receive_thread_udp, daemon=True).start()
+
         # 1. Conecta ao nó overlay
         if not self._connect_to_overlay():
             print(f"[{self.client_id}] ERRO: Não conseguiu conectar ao overlay!")
@@ -196,7 +205,7 @@ class StreamingClient:
                     header = json.loads(header_data.decode('utf-8'))
                     msg_type = header.get('type')
                     
-                    # 🔥 MUDANÇA 4: Processa diferentes tipos de mensagem
+                    #  MUDANÇA 4: Processa diferentes tipos de mensagem
                     if msg_type == MessageType.STREAM_DATA.value:
                         # É STREAM_DATA - lê o payload
                         data_length = header['data_length']
@@ -231,6 +240,51 @@ class StreamingClient:
         
         self.receiving = False
     
+    def _receive_thread_udp(self):
+        """Recebe pacotes UDP e imprime animação"""
+        print(f"[{self.client_id}] À espera de dados UDP na porta 5001...")
+        
+        while self.running:
+            try:
+                # 1. Recebe pacote
+                packet, addr = self.udp_socket.recvfrom(60000)
+                
+                # 2. Parse do Cabeçalho
+                head_len = int.from_bytes(packet[:4], 'big')
+                
+                # (Opcional) Ler JSON para ver número de sequência
+                # header_json = packet[4:4+head_len]
+                # header = json.loads(header_json)
+                
+                # 3. Extrair Payload (JPEG)
+                jpg_data = packet[4+head_len:]
+                
+                # 4. Descodificar Imagem
+                # Converte bytes para array numpy
+                nparr = np.frombuffer(jpg_data, np.uint8)
+                # Descodifica
+                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                
+                if img is not None:
+                    # 5. Mostrar na Janela
+                    window_name = f"Cliente {self.client_id} ({self.flow_id})"
+                    cv2.imshow(window_name, img)
+                    
+                    # Necessário para o OpenCV atualizar a janela (1ms)
+                    # Pressionar 'q' fecha a janela (opcional)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+                    
+                    self.frames_received += 1
+                else:
+                    print(f"[{self.client_id}] Frame corrompido/incompleto")
+                
+            except Exception as e:
+                print(f"Erro RX UDP: {e}")
+                pass 
+                
+        cv2.destroyAllWindows()
+
     def _recv_exact(self, length: int) -> bytes:
         """Recebe exatamente N bytes"""
         data = b''

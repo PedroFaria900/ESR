@@ -25,6 +25,8 @@ class MessageType(Enum):
     PING = "PING"                   # Teste de caminho
     PONG = "PONG"                   # Resposta ao ping
 
+    LATENCY_PING = "LATENCY_PING"   # Ping para medir RTT 
+    LATENCY_PONG = "LATENCY_PONG"   # Pong para medir resposta ao PING
 
 class Message:
     """Classe base para mensagens do protocolo"""
@@ -48,6 +50,62 @@ class Message:
     
     def __str__(self):
         return f"Message({self.type}, {self.data})"
+
+# ============================================================
+# NOVAS MENSAGENS DE LATÊNCIA
+# ============================================================
+
+def create_latency_ping_message(from_node: str, ping_id: str, 
+                                timestamp: float) -> Message:
+    """
+    LATENCY_PING - Ping para medir RTT entre vizinhos
+    
+    Diferente do PING de teste de caminho!
+    Este é apenas para medir latência ponto-a-ponto.
+    
+    Enviado por: Qualquer nó
+    Destinatário: Vizinho direto
+    Periodicidade: A cada X segundos (ex: 2s)
+    
+    Exemplo:
+    {
+        "type": "LATENCY_PING",
+        "from_node": "n10",
+        "ping_id": "abc123",
+        "timestamp": 1234567890.123
+    }
+    """
+    return Message(
+        MessageType.LATENCY_PING,
+        from_node=from_node,
+        ping_id=ping_id,
+        timestamp=timestamp
+    )
+
+
+def create_latency_pong_message(from_node: str, ping_id: str, 
+                                original_timestamp: float) -> Message:
+    """
+    LATENCY_PONG - Resposta ao LATENCY_PING
+    
+    Enviado por: Vizinho que recebeu o PING
+    Destinatário: Quem enviou o PING
+    
+    Exemplo:
+    {
+        "type": "LATENCY_PONG",
+        "from_node": "n16",
+        "ping_id": "abc123",
+        "original_timestamp": 1234567890.123
+    }
+    """
+    return Message(
+        MessageType.LATENCY_PONG,
+        from_node=from_node,
+        ping_id=ping_id,
+        original_timestamp=original_timestamp
+    )
+
 
 
 # ============================================================
@@ -129,32 +187,20 @@ def create_hello_message(from_node: str, timestamp: float = None) -> Message:
 def create_announce_message(
     flow_id: str,
     from_node: str,
-    metric: int,
+    metric: float,
     msg_id: str = None
 ) -> Message:
     """
     ANNOUNCE - Servidor anuncia disponibilidade de stream
     
-    Enviado por: Servidor (n16)
-    Periodicidade: A cada X segundos (ex: 5s)
-    Processamento: Cada nó reencaminha a TODOS os vizinhos,
-                   incrementando a métrica
+    MUDANÇA: metric agora é float (latência em ms) em vez de int (saltos)
     
-    Exemplo:
+    Exemplo com latência (novo):
     {
         "type": "ANNOUNCE",
         "flow_id": "stream1",
         "from_node": "n16",
-        "metric": 0,
-        "msg_id": "announce_123456"
-    }
-    
-    Quando n10 recebe e reencaminha:
-    {
-        "type": "ANNOUNCE",
-        "flow_id": "stream1",
-        "from_node": "n16",
-        "metric": 1,
+        "metric": 45.3,  # 45.3ms de latência acumulada
         "msg_id": "announce_123456"
     }
     """

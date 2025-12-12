@@ -11,10 +11,12 @@ import threading
 import json
 import time
 import sys
+import cv2
 from typing import Dict, List
 
 from protocol import *
 from routing_table import RoutingTable
+from latency_monitor import LatencyMonitor
 
 
 class StreamingServer:
@@ -33,8 +35,26 @@ class StreamingServer:
         # Estruturas de dados
         self.registered_nodes: Dict[str, Dict] = {}  # Nós que se registaram
         self.neighbors: Dict[str, socket.socket] = {}  # Vizinhos conectados
+
+        self.routing_table = RoutingTable(
+            node_id=node_id,
+            hysteresis_threshold=0.15,  # 15% de melhoria mínima
+            jitter_tolerance=5.0        # 5ms de tolerância
+        )
+
         self.routing_table = RoutingTable(node_id)
         
+        # Monitor de Latência
+        self.latency_monitor = LatencyMonitor(
+            node_id=node_id,
+            ping_interval=2.0,
+            window_size=5,
+            timeout=5.0
+        )
+
+        # Socket UDP de envio
+        self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
         # Streaming
         self.flow_id = self.topology['config']['stream_id']
         self.streaming = False
@@ -50,12 +70,14 @@ class StreamingServer:
     def start(self):
         """Inicia servidor"""
         self.running = True
-        
+
+        self.latency_monitor.start()
+
         # === ADICIONAR ISTO: Inicializa a rota local ===
         self.routing_table.update_route(
             flow_id=self.flow_id,
             origin=self.node_id,
-            metric=0,
+            metric=0.0,
             via_neighbor=self.node_id
         )
         # ===============================================
@@ -64,7 +86,7 @@ class StreamingServer:
         threading.Thread(target=self._server_thread, daemon=True).start()
         time.sleep(1.0)  # Aguarda servidor arrancar
         
-        print(f"[{self.node_id}] ⏳ Aguardando 10 segundos para vizinhos iniciarem...")
+        print(f"[{self.node_id}] Aguardando 10 segundos para vizinhos iniciarem...")
         time.sleep(10)  # ✅ AGUARDA os vizinhos estarem prontos
         
         # 2. Conecta aos vizinhos diretos (da topologia)
@@ -73,6 +95,8 @@ class StreamingServer:
         # 3. Thread de ANNOUNCEs
         threading.Thread(target=self._announce_thread, daemon=True).start()
         
+        threading.Thread(target=self._latency_ping_thread, daemon=True).start()
+
         # 4. Thread de streaming (inicia depois)
         threading.Thread(target=self._streaming_thread, daemon=True).start()
         
@@ -257,6 +281,9 @@ class StreamingServer:
                 sock.settimeout(None)
                 
                 self.neighbors[neighbor_id] = sock
+
+                self.latency_monitor.add_neighbor(neighbor_id)
+
                 print(f"[{self.node_id}]   ✓ Conectado a {neighbor_id}")
                 
                 # Thread para escutar
@@ -284,14 +311,7 @@ class StreamingServer:
             sock.close()
             return
         
-        # Envia ANNOUNCE inicial imediatamente
-        try:
-            time.sleep(0.5)
-            msg = create_announce_message(self.flow_id, self.node_id, 0)
-            send_message(sock, msg)
-            print(f"[{self.node_id}] → ANNOUNCE inicial enviado para {neighbor_id}")
-        except Exception as e:
-            print(f"[{self.node_id}] Erro ao enviar ANNOUNCE inicial: {e}")
+        time.sleep(2.0)
         
         while self.running:
             try:
@@ -307,6 +327,7 @@ class StreamingServer:
         
         if neighbor_id in self.neighbors:
             del self.neighbors[neighbor_id]
+            self.latency_monitor.remove_neighbor(neighbor_id)
             print(f"[{self.node_id}] Vizinho {neighbor_id} desconectado")
         
         try:
@@ -325,6 +346,12 @@ class StreamingServer:
         elif msg_type == MessageType.DEACTIVATE: 
             self._handle_deactivate(msg, from_neighbor)
         
+        elif msg_type == MessageType.LATENCY_PING:
+            self._handle_latency_ping(msg, conn, from_neighbor)
+        
+        elif msg_type == MessageType.LATENCY_PONG:
+            self._handle_latency_pong(msg, from_neighbor)
+
         elif msg_type == MessageType.HELLO:
             pass  # Keepalive
         
@@ -379,6 +406,31 @@ class StreamingServer:
         else:
             print(f"[{self.node_id}]   Ainda há {len(destinations)} destino(s) ativo(s)")
     
+    def _handle_latency_ping(self, msg: Message, conn: socket.socket, 
+                            from_neighbor: str):
+        """Responde a LATENCY_PING"""
+        ping_id = msg.data['ping_id']
+        original_timestamp = msg.data['timestamp']
+        
+        try:
+            pong = create_latency_pong_message(
+                from_node=self.node_id,
+                ping_id=ping_id,
+                original_timestamp=original_timestamp
+            )
+            send_message(conn, pong)
+        except:
+            pass
+    
+    def _handle_latency_pong(self, msg: Message, from_neighbor: str):
+        """Processa LATENCY_PONG"""
+        ping_id = msg.data['ping_id']
+        original_timestamp = msg.data['original_timestamp']
+        
+        rtt_ms = self.latency_monitor.process_pong(
+            from_neighbor, ping_id, original_timestamp
+        )
+
     # ========================================================
     # ANÚNCIOS PERIÓDICOS
     # ========================================================
@@ -390,11 +442,11 @@ class StreamingServer:
         print(f"[{self.node_id}] A enviar ANNOUNCEs a cada {interval}s")
         
         # Aguarda um pouco antes de começar
-        time.sleep(2)
+        time.sleep(10.0)
         
         while self.running:
             # Cria ANNOUNCE
-            msg = create_announce_message(self.flow_id, self.node_id, 0)
+            msg = create_announce_message(self.flow_id, self.node_id, 0.0)
             
             # Envia a todos os vizinhos
             sent_count = 0
@@ -415,87 +467,99 @@ class StreamingServer:
     # ========================================================
     
     def _streaming_thread(self):
-        """Envia dados de streaming"""
-        print(f"[{self.node_id}] Thread de streaming iniciada (aguardando ativação)...")
+        """Envia dados de streaming via UDP"""
+        print(f"[{self.node_id}] Thread de streaming UDP iniciada...")
+
+        cap = cv2.VideoCapture('movie.Mjpeg') 
         
+        if not cap.isOpened():
+            print(f"[{self.node_id}] ERRO CRÍTICO: Não encontrei 'movie.Mjpeg'!")
+            return
+
         sequence = 0
-        fps = 2  # Frames por segundo
-        frame_interval = 1.0 / fps
-        
-        if "2" in self.flow_id:
-            # Animação de "Loading" Quadrada
-            frames_ascii = [
-                "[=      ]", 
-                "[==     ]", 
-                "[===    ]", 
-                "[====   ]", 
-                "[=====  ]", 
-                "[====== ]", 
-                "[=======]"
-            ]
-            tema = "STREAM 2 (Quadrado)"
-        else:
-            # Animação de "Radar" Circular (stream1)
-            frames_ascii = [
-                "(  o  )", 
-                "( o o )", 
-                "(o   o)", 
-                "( o o )", 
-                "(  o  )", 
-                "(  .  )"
-            ]
-            tema = "STREAM 1 (Bola)"
 
         while self.running:
-            # Aguarda até streaming estar ativo
+            # Pausa se não houver clientes ativos
             if not self.streaming:
-                time.sleep(1)
-                sequence = 0  # Reset quando não há destinos
+                time.sleep(0.5)
                 continue
             
-            # Obtém destinos ativos
             destinations = self.routing_table.get_destinations(self.flow_id)
-            
             if not destinations:
-                time.sleep(1)
-                sequence = 0  # Reset quando não há destinos
+                time.sleep(0.5)
                 continue
+
+            # 1. Lê Frame do ficheiro
+            ret, frame = cap.read()
+            if not ret:
+                # Fim do vídeo -> Reinicia (Loop infinito)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+
+            # 2. Reduz resolução (CRÍTICO para UDP!)
+            # O UDP tem limite de ~65KB. 320x240 gera frames de 15-20KB, o que é seguro.
+            frame = cv2.resize(frame, (320, 240))
+
+            # 3. Comprime para JPEG
+            # Qualidade 50 é suficiente para testes e poupa banda
+            _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
+            jpg_bytes = buffer.tobytes()
             
-            # Marca tempo de início
-            frame_start = time.time()
-            
-            # Cria dados de teste (simulação)
-            # --- CRIA O FRAME VISUAL ---
-            visual = frames_ascii[sequence % len(frames_ascii)]
-            
-            # Monta a mensagem para ser bonita no terminal do cliente
-            # Ex: "stream1: ( o ) [Seq: 42]"
-            payload_str = f"\n >> {self.flow_id.upper()} <<\n {visual}\n Seq: {sequence}"
-            data = payload_str.encode('utf-8')
-            
-            stream_msg = create_stream_data_message(self.flow_id, sequence, data)
-            
-            # Envia para todos os destinos
+            # Segurança: Se o frame for gigante, salta-o para não partir o UDP
+            if len(jpg_bytes) > 60000:
+                print(f"[{self.node_id}] Frame muito grande ({len(jpg_bytes)} bytes), ignorado.")
+                continue
+
+            # 4. Cria Pacote (Usa a função existente)
+            # [Tamanho 4B] + [Header JSON] + [Bytes JPEG]
+            udp_packet = create_stream_data_message(self.flow_id, sequence, jpg_bytes)
+
+            # 5. Envia via UDP para os vizinhos
             sent_count = 0
             for dest_id in destinations:
                 if dest_id in self.neighbors:
                     try:
-                        send_raw_bytes(self.neighbors[dest_id], stream_msg)
+                        # Descobre IP do vizinho pelo socket TCP
+                        tcp_sock = self.neighbors[dest_id]
+                        dest_ip, _ = tcp_sock.getpeername()
+                        
+                        # Envia para a porta 5000 UDP
+                        self.udp_socket.sendto(udp_packet, (dest_ip, 5000))
                         sent_count += 1
                     except Exception as e:
-                        print(f"[{self.node_id}] Erro ao enviar para {dest_id}: {e}")
-            
-            if sent_count > 0 and sequence % 10 == 0:
-                print(f"[{self.node_id}] A transmitir {tema}: Frame {sequence}")
-            
+                        print(f"Erro UDP: {e}")
+
+            if sequence % 20 == 0:
+                print(f"[{self.node_id}] Enviado Frame {sequence} ({len(jpg_bytes)} bytes) para {sent_count} vizinhos")
+
             sequence += 1
-            
-            # Controlo de taxa (FPS)
-            elapsed = time.time() - frame_start
-            sleep_time = frame_interval - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+            time.sleep(0.04) # ~25 FPS
     
+    # ========================================================
+    # Envia LATENCY_PING
+    # ========================================================
+    
+    def _latency_ping_thread(self):
+        """Thread que envia LATENCY_PING para medir RTT"""
+        print(f"[{self.node_id}] Thread de latência iniciada")
+        
+        while self.running:
+            time.sleep(2.0)
+            
+            self.latency_monitor.cleanup_timeouts()
+            
+            for neighbor_id, sock in list(self.neighbors.items()):
+                try:
+                    ping_id, timestamp = self.latency_monitor.create_ping_message(neighbor_id)
+                    msg = create_latency_ping_message(
+                        from_node=self.node_id,
+                        ping_id=ping_id,
+                        timestamp=timestamp
+                    )
+                    send_message(sock, msg)
+                except:
+                    pass
+
     # ========================================================
     # ESTATÍSTICAS
     # ========================================================
@@ -510,6 +574,7 @@ class StreamingServer:
             print(f"  Vizinhos conectados: {list(self.neighbors.keys())}")
             print(f"  Streaming: {'SIM' if self.streaming else 'NÃO'}")
             print(f"  Rotas: {self.routing_table.get_stats()}")
+            self.latency_monitor.print_stats()
             self.routing_table.print_table()
 
 

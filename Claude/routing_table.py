@@ -15,14 +15,14 @@ class RouteEntry:
     Campos conforme especificação do enunciado:
     - flow_id: Identificador do fluxo (ex: "stream1")
     - origin: Nó de origem do fluxo (ex: "n16")
-    - metric: Custo do caminho (ex: número de saltos)
+    - metric: Custo do caminho (ex: latencia)
     - via_neighbor: Vizinho pelo qual recebi o ANNOUNCE
     - destinations: Lista de vizinhos para onde reencaminhar
     - active: Se a rota está ativa (cliente pediu)
     """
     flow_id: str                    # ID do fluxo
     origin: str                     # Nó origem (servidor)
-    metric: int                     # Custo (nº saltos, latência, etc)
+    metric: float                     # Custo (latência em ms)
     via_neighbor: str               # De onde veio (IP ou node_id)
     destinations: List[str] = field(default_factory=list)  # Para onde enviar
     active: bool = False            # Se está ativa
@@ -32,7 +32,7 @@ class RouteEntry:
         status = "ACTIVE" if self.active else "INACTIVE"
         dests = ', '.join(self.destinations) if self.destinations else "none"
         return (f"[{status}] {self.flow_id}: from {self.origin} "
-                f"via {self.via_neighbor} (metric={self.metric}) -> [{dests}]")
+                f"via {self.via_neighbor} (metric={self.metric:.2f}ms) -> [{dests}]")
 
 
 class RoutingTable:
@@ -44,18 +44,24 @@ class RoutingTable:
     - Vizinhos para onde reencaminhar dados
     """
     
-    def __init__(self, node_id: str):
+    def __init__(self, node_id: str, hysteresis_threshold: float = 0.15,  # 15%
+                 jitter_tolerance: float = 5.0):
         self.node_id = node_id
         self.routes: Dict[str, RouteEntry] = {}  # {flow_id: RouteEntry}
         self.seen_announces: set = set()  # Para evitar loops
     
-    # Em Claude/routing_table.py
+
+        self.hysteresis_threshold = hysteresis_threshold
+        self.jitter_tolerance = jitter_tolerance
+
+        print(f"[ROUTING] Tabela criada com histerese de {hysteresis_threshold*100:.0f}% "
+            f"e tolerância a jitter de {jitter_tolerance}ms")
 
     def update_route(
         self,
         flow_id: str,
         origin: str,
-        metric: int,
+        metric: float,
         via_neighbor: str,
         msg_id: str = None
     ) -> bool:
@@ -83,7 +89,7 @@ class RoutingTable:
         
         current = self.routes[flow_id]
         
-        # 1. Se a nova rota é MELHOR (menor métrica) -> Atualiza tudo
+        # 1. Se a nova rota é MELHOR (menor latência) -> Atualiza tudo
         if metric < current.metric:
             current.origin = origin
             current.metric = metric
@@ -92,12 +98,79 @@ class RoutingTable:
             print(f"[ROUTING] Rota melhorada: {current}")
             return True
             
-        # 2. Se é a MESMA rota vinda do MESMO vizinho -> Refresh (CRÍTICO PARA PROPAGAÇÃO)
-        elif metric == current.metric and via_neighbor == current.via_neighbor:
-            current.last_update = time.time()
-            return True 
+        # 2. SMesma rota, mesmo vizinho (REFRESH)
+        if via_neighbor == current.via_neighbor:
+            # Aceita como refresh se a variação for pequena (jitter)
+            latency_diff = abs(metric - current.metric)
+            
+            if latency_diff <= self.jitter_tolerance:
+                # Variação aceitável - apenas refresh
+                current.metric = metric  # Atualiza para novo valor
+                current.last_update = time.time()
+                return True  # Reencaminha para propagar atualização
+            
+            elif metric < current.metric:
+                # Melhoria significativa da mesma rota
+                improvement_pct = (current.metric - metric) / current.metric * 100
+                current.metric = metric
+                current.last_update = time.time()
+                print(f"[ROUTING] ✓ Rota via {via_neighbor} melhorou "
+                      f"{improvement_pct:.1f}% ({current.metric:.2f}ms)")
+                return True
+            
+            else:
+                # Pioria da mesma rota (congestionamento?)
+                degradation_pct = (metric - current.metric) / current.metric * 100
+                current.metric = metric
+                current.last_update = time.time()
+                print(f"[ROUTING] ⚠️ Rota via {via_neighbor} piorou "
+                      f"{degradation_pct:.1f}% ({current.metric:.2f}ms)")
+                return True
         
-        return False
+        # 3. Rota alternativa (vizinho diferente)
+        
+        # Calcula melhoria necessária (threshold)
+        improvement_needed = current.metric * self.hysteresis_threshold
+        threshold_latency = current.metric - improvement_needed
+        
+        if metric < threshold_latency:
+            # Nova rota é SIGNIFICATIVAMENTE melhor
+            improvement_pct = (current.metric - metric) / current.metric * 100
+            
+            print(f"[ROUTING] 🔄 TROCA DE ROTA: {current.via_neighbor} → {via_neighbor}")
+            print(f"[ROUTING]    Antes: {current.metric:.2f}ms")
+            print(f"[ROUTING]    Agora: {metric:.2f}ms")
+            print(f"[ROUTING]    Melhoria: {improvement_pct:.1f}% "
+                  f"(threshold: {self.hysteresis_threshold*100:.0f}%)")
+            
+            # ⚠️ IMPORTANTE: NÃO apaga destinos!
+            # Guarda destinos antes de atualizar
+            old_destinations = current.destinations.copy()
+            old_active = current.active
+            
+            # Atualiza rota
+            current.origin = origin
+            current.metric = metric
+            current.via_neighbor = via_neighbor
+            current.last_update = time.time()
+            
+            # Restaura destinos e estado
+            current.destinations = old_destinations
+            current.active = old_active
+            
+            return True
+        
+        else:
+            # Nova rota não é suficientemente melhor
+            improvement_pct = (current.metric - metric) / current.metric * 100
+            
+            # Log apenas se a diferença for notável (> 5%)
+            if improvement_pct > 5:
+                print(f"[ROUTING] ⏸️ Rota via {via_neighbor} ignorada "
+                      f"({metric:.2f}ms, melhoria {improvement_pct:.1f}% < "
+                      f"{self.hysteresis_threshold*100:.0f}%)")
+            
+            return False
     
     def activate_route(self, flow_id: str, destination: str) -> bool:
         """
@@ -225,7 +298,9 @@ class RoutingTable:
         """Imprime tabela de rotas (debug)"""
         print(f"\n{'='*70}")
         print(f"ROUTING TABLE - Node {self.node_id}")
-        print(f"{'='*70}")
+        print(f"  (Histerese: {self.hysteresis_threshold*100:.0f}%, "
+              f"Jitter: ±{self.jitter_tolerance}ms)")
+        print(f"{'='*75}")
         
         if not self.routes:
             print("  (vazia)")
@@ -233,7 +308,7 @@ class RoutingTable:
             for flow_id, route in self.routes.items():
                 print(f"  {route}")
         
-        print(f"{'='*70}\n")
+        print(f"{'='*75}\n")
     
     def get_stats(self) -> Dict:
         """Retorna estatísticas da tabela"""
@@ -243,7 +318,9 @@ class RoutingTable:
         return {
             "total_routes": total,
             "active_routes": active,
-            "inactive_routes": total - active
+            "inactive_routes": total - active,
+            "hysteresis_pct": self.hysteresis_threshold * 100,
+            "jitter_tolerance_ms": self.jitter_tolerance
         }
 
     def process_neighbor_down(self, neighbor_id: str):
@@ -262,7 +339,7 @@ class RoutingTable:
             if route.via_neighbor == neighbor_id:
                 print(f"[ROUTING] Rota para {flow_id} QUEBRADA (era via {neighbor_id}). Aguardando novo caminho...")
                 # Não apagamos (del). Apenas marcamos como inválida/infinita
-                route.metric = 9999  # Infinito
+                route.metric = 9999.0  # Infinito
                 route.via_neighbor = None # Sem fornecedor
                 # route.active mantemos como True se tiver destinos
                 # route.destinations MANTÉM-SE INTACTO!
@@ -274,7 +351,24 @@ class RoutingTable:
                 
                 if not route.destinations:
                     route.active = False
+# ============================================================
+# FUNÇÕES AUXILIARES
+# ============================================================
 
+def format_latency(latency_ms: float) -> str:
+    """
+    Formata latência para display
+    
+    Args:
+        latency_ms: Latência em milissegundos
+    
+    Returns:
+        String formatada (ex: "12.5ms", "150ms", "1.2s")
+    """
+    if latency_ms < 1000:
+        return f"{latency_ms:.1f}ms"
+    else:
+        return f"{latency_ms/1000:.2f}s"
 
 # ============================================================
 # EXEMPLO DE USO

@@ -17,7 +17,7 @@ from typing import Dict, List, Any
 
 from protocol import *
 from routing_table import RoutingTable
-
+from latency_monitor import LatencyMonitor
 
 class OverlayNode:
     """Nó da rede overlay (relay)"""
@@ -33,22 +33,49 @@ class OverlayNode:
         # Estruturas de dados
         self.neighbors: Dict[str, socket.socket] = {}
         self.neighbor_info: Dict[str, Dict] = {}
+
+        self.routing_table = RoutingTable(
+            node_id=node_id,
+            hysteresis_threshold=0.15,  # 15% de melhoria mínima
+            jitter_tolerance=5.0        # 5ms de tolerância
+        )
+
         self.routing_table = RoutingTable(node_id)
-        
+
+        # Monitor de Latência
+        self.latency_monitor = LatencyMonitor(
+            node_id=node_id,
+            ping_interval=2.0,    # Ping a cada 2s
+            window_size=5,       # Média de 10 amostras
+            timeout=5.0           # Timeout de 5s
+        )        
+
+        # --- NOVO: Socket UDP para Dados ---
+        self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
         # Locks
         self.neighbors_lock = threading.Lock()
-        
+        # Vincula à mesma porta do TCP (ex: 5000)
+        self.udp_socket.bind(('0.0.0.0', self.my_port))
+
         # Controlo
         self.running = False
         self.server_socket = None
         
         print(f"[{self.node_id}] Nó overlay criado")
         print(f"[{self.node_id}] IP: {self.my_ip}:{self.my_port}")
+        print(f"[{self.node_id}] Canal UDP pronto em port {self.my_port}")
     
     def start(self):
         """Inicia o nó overlay"""
         self.running = True
         
+        # Inicia monitor de latência
+        self.latency_monitor.start()
+
+        # Inicia thread UDP (NOVO)
+        threading.Thread(target=self._udp_server_thread, daemon=True).start()
+
         # 1. Inicia servidor (escuta conexões)
         threading.Thread(target=self._server_thread, daemon=True).start()
         time.sleep(1)
@@ -63,6 +90,7 @@ class OverlayNode:
         # 4. Threads de manutenção
         threading.Thread(target=self._keepalive_thread, daemon=True).start()
         threading.Thread(target=self._reconnect_thread, daemon=True).start()
+        threading.Thread(target=self._latency_ping_thread, daemon=True).start()
         threading.Thread(target=self._stats_thread, daemon=True).start()
         
         print(f"[{self.node_id}] Nó iniciado!")
@@ -153,6 +181,9 @@ class OverlayNode:
                         with self.neighbors_lock:
                             self.neighbors[from_neighbor] = conn
                         
+                        # ADICIONAR AO MONITOR ==========
+                        self.latency_monitor.add_neighbor(from_neighbor)
+
                         # Processa a primeira mensagem
                         self._process_message(msg, conn, addr, from_neighbor)
 
@@ -180,7 +211,7 @@ class OverlayNode:
     def _listen_to_connection(self, conn: socket.socket, from_node: str):
         """
         Loop principal de escuta.
-        ⚠️ CRÍTICO: Gere a limpeza da tabela de rotas quando a conexão cai.
+        CRÍTICO: Gere a limpeza da tabela de rotas quando a conexão cai.
         """
         try:
             while self.running:
@@ -228,15 +259,46 @@ class OverlayNode:
             if from_node:
                 # print(f"[{self.node_id}] A limpar conexão de {from_node}...")
                 
+                affected_flows = []
+                # Como a tabela de rotas não tem lookup inverso fácil, procuramos manualmente
+                if hasattr(self, 'routing_table'):
+                    for flow_id, route in self.routing_table.routes.items():
+                        if from_node in route.destinations:
+                            affected_flows.append(flow_id)
+
                 with self.neighbors_lock:
                     # Verifica se este ainda é o socket ativo (para evitar remover reconexões novas)
                     if from_node in self.neighbors and self.neighbors[from_node] == conn:
                         del self.neighbors[from_node]
-                        print(f"[{self.node_id}] Vizinho {from_node} desconectado/removido.")
+                        print(f"[{self.node_id}] Vizinho {from_node} desconectado.")
                         
-                        # 🔥 AVISA A TABELA DE ROTAS PARA RECALCULAR
+                        # REMOVER DO MONITOR
+                        self.latency_monitor.remove_neighbor(from_node)
+
+                        # AVISA A TABELA DE ROTAS PARA RECALCULAR
                         self.routing_table.process_neighbor_down(from_node)
-            
+                
+                for flow_id in affected_flows:
+                    remaining_dests = self.routing_table.get_destinations(flow_id)
+                    
+                    if not remaining_dests:
+                        # Ficámos sem ninguém a ouvir este fluxo. Cancelar a montante!
+                        next_hop = self.routing_table.get_next_hop(flow_id)
+                        
+                        if next_hop:
+                            print(f"[{self.node_id}] Rota {flow_id} ficou vazia após saída de {from_node}. Enviando DEACTIVATE auto...")
+                            
+                            try:
+                                # Cria mensagem DEACTIVATE em nosso nome
+                                msg = create_deactivate_message(flow_id, self.node_id, next_hop)
+                                
+                                # Envia para o próximo salto (em direção ao servidor)
+                                with self.neighbors_lock:
+                                    if next_hop in self.neighbors:
+                                        send_message(self.neighbors[next_hop], msg)
+                            except Exception as e:
+                                print(f"[{self.node_id}] Erro ao enviar DEACTIVATE auto: {e}")
+
             try:
                 conn.close()
             except:
@@ -254,6 +316,66 @@ class OverlayNode:
                 return None
         return data
     
+    def _udp_server_thread(self):
+        """Escuta pacotes UDP e reencaminha"""
+        print(f"[{self.node_id}] Thread UDP iniciada...")
+        while self.running:
+            try:
+                # Recebe pacote (60KB buffer seguro)
+                data, addr = self.udp_socket.recvfrom(60000)
+                # Reencaminha
+                self._handle_udp_packet(data, addr)
+            except Exception as e:
+                if self.running:
+                    print(f"[{self.node_id}] Erro UDP: {e}")
+
+    def _handle_udp_packet(self, data: bytes, source_addr):
+        """Lê header e reencaminha baseado no flow_id"""
+        try:
+            # 1. Parse do cabeçalho (Formato: [Len][JSON][Data])
+            if len(data) < 4: return
+            header_len = int.from_bytes(data[:4], 'big')
+            if len(data) < 4 + header_len: return
+            
+            header_json = data[4:4+header_len]
+            header = json.loads(header_json.decode('utf-8'))
+            
+            flow_id = header.get('flow_id')
+            if not flow_id: return
+            
+            # 2. Consulta Tabela de Rotas
+            destinations = self.routing_table.get_destinations(flow_id)
+            if not destinations:
+                return
+
+            # 3. Encaminha para cada destino
+            for dest_id in destinations:
+                dest_ip = None
+                dest_port = 5000 # Porta padrão para nós overlay
+
+                # Caso A: É um vizinho conhecido da topologia (Relay)
+                if dest_id in self.neighbor_info:
+                    dest_ip = self.neighbor_info[dest_id]['ip']
+                    dest_port = self.neighbor_info[dest_id]['port']
+                
+                # Caso B: É um cliente dinâmico (não está no neighbor_info)
+                elif dest_id in self.neighbors:
+                    try:
+                        # Truque: Buscar IP ao socket TCP conectado
+                        tcp_sock = self.neighbors[dest_id]
+                        dest_ip, _ = tcp_sock.getpeername()
+                        dest_port = 5001 # Clientes usam 5001 (ver topology.json)
+                    except:
+                        continue
+
+                if dest_ip:
+                    # Split Horizon: Não enviar de volta para a origem (pelo IP)
+                    if dest_ip != source_addr[0]:
+                        self.udp_socket.sendto(data, (dest_ip, dest_port))
+                        
+        except Exception:
+            pass
+            
     # ========================================================
     # REGISTO E VIZINHOS
     # ========================================================
@@ -335,6 +457,9 @@ class OverlayNode:
                 self.neighbors[neighbor_id] = sock
             
             self.neighbor_info[neighbor_id] = neighbor
+
+            # ADICIONAR AO MONITOR
+            self.latency_monitor.add_neighbor(neighbor_id)
             
             print(f"[{self.node_id}] ✓ Conectado a {neighbor_id}")
             
@@ -371,7 +496,13 @@ class OverlayNode:
 
         elif msg_type == MessageType.DEACTIVATE:
             self._handle_deactivate(msg, from_neighbor)
+
+        elif msg_type == MessageType.LATENCY_PING:
+            self._handle_latency_ping(msg, conn, from_neighbor)
         
+        elif msg_type == MessageType.LATENCY_PONG:
+            self._handle_latency_pong(msg, from_neighbor)
+
         elif msg_type == MessageType.PING:
             self._handle_ping(msg, from_neighbor)
         
@@ -382,19 +513,79 @@ class OverlayNode:
         """Processa ANNOUNCE e propaga"""
         flow_id = msg.data['flow_id']
         origin = msg.data['from_node']
-        metric = msg.data['metric']
+        received_metric = msg.data['metric']
         msg_id = msg.data.get('msg_id')
         
+        link_latency = self.latency_monitor.get_latency(from_node)
+
+        # Obtém estatísticas da medição
+        latency_stats = self.latency_monitor.get_stats()
+        neighbor_stats = latency_stats.get('latencies', {}).get(from_node, {})
+
+        if link_latency is None:
+            # Ainda não temos medida - usa estimativa conservadora
+            link_latency = 10.0  # 10ms default
+            samples_info = "sem dados"
+        else:
+            n_samples = neighbor_stats.get('samples', 0)
+            samples_info = f"n={n_samples}"
+
+        print(f"[{self.node_id}] ANNOUNCE de {origin} via {from_node}:")
+        print(f"[{self.node_id}]   recebido={received_metric:.2f}ms")
+        print(f"[{self.node_id}]   link={link_latency:.2f}ms ({samples_info})")
+
+        my_metric = received_metric + link_latency
+
+        print(f"[{self.node_id}]   total={my_metric:.2f}ms")
+
         # Verifica se tínhamos destinos à espera (antes do update)
         was_active_with_destinations = False
         old_route = self.routing_table.get_route(flow_id)
         if old_route and old_route.destinations:
             was_active_with_destinations = True
 
+        # === 1. GUARDAR ESTADO ANTERIOR ===
+        old_route = self.routing_table.get_route(flow_id)
+        old_via = old_route.via_neighbor if old_route else None
+        was_active = old_route.active if old_route else False
+
         # Atualiza tabela
         should_forward = self.routing_table.update_route(
-            flow_id, origin, metric, from_node, msg_id
+            flow_id=flow_id,
+            origin=origin,
+            metric=my_metric,      # ← USA MÉTRICA TOTAL, NÃO A RECEBIDA!
+            via_neighbor=from_node,
+            msg_id=msg_id
         )
+
+        # === 2. VERIFICAR SE MUDOU DE VIZINHO (NOVO) ===
+        if was_active and should_forward:
+            new_route = self.routing_table.get_route(flow_id)
+            new_via = new_route.via_neighbor
+            
+            # Se mudámos de fornecedor (Ex: de n6 para n7)
+            if old_via and new_via and old_via != new_via:
+                print(f"[{self.node_id}] 🔀 Troca de Rota: {old_via} -> {new_via}. Cancelando anterior...")
+                
+                # A. Envia DEACTIVATE para o vizinho VELHO
+                try:
+                    deact_msg = create_deactivate_message(flow_id, self.node_id, old_via)
+                    with self.neighbors_lock:
+                        if old_via in self.neighbors:
+                            send_message(self.neighbors[old_via], deact_msg)
+                            print(f"[{self.node_id}]   🚫 DEACTIVATE enviado para antigo pai {old_via}")
+                except Exception as e:
+                    print(f"[{self.node_id}] Erro ao limpar rota antiga: {e}")
+
+                # B. Envia ACTIVATE para o vizinho NOVO (Isto tu já tinhas, mas confirma)
+                try:
+                    act_msg = create_activate_message(flow_id, self.node_id, origin)
+                    with self.neighbors_lock:
+                        if new_via in self.neighbors:
+                            send_message(self.neighbors[new_via], act_msg)
+                            print(f"[{self.node_id}]   ✅ ACTIVATE enviado para novo pai {new_via}")
+                except Exception as e:
+                    print(f"[{self.node_id}] Erro ao ativar nova rota: {e}")
 
         # --- LÓGICA DE RECUPERAÇÃO AUTOMÁTICA ---
         # Se a rota foi atualizada e nós temos clientes à espera, 
@@ -403,7 +594,7 @@ class OverlayNode:
             route = self.routing_table.get_route(flow_id)
             # Se a rota agora é válida e temos destinos, enviamos ACTIVATE para montante
             if route.via_neighbor and route.via_neighbor == from_node:
-                print(f"[{self.node_id}] ♻️ Rota recuperada via {from_node}! Reenviando ACTIVATE...")
+                print(f"[{self.node_id}] Rota recuperada via {from_node}! Reenviando ACTIVATE...")
                 
                 # Garante que está ativa na tabela
                 route.active = True 
@@ -415,25 +606,37 @@ class OverlayNode:
                     with self.neighbors_lock:
                         if from_node in self.neighbors:
                             send_message(self.neighbors[from_node], activate_msg)
+                            print(f"[{self.node_id}]   → ACTIVATE enviado para {from_node}")
                 except Exception as e:
                     print(f"[{self.node_id}] Erro ao recuperar stream: {e}")
         
         if should_forward:
-            print(f"[{self.node_id}] Rota atualizada via {from_node} (métrica={metric}). Reencaminhando...")
-            new_metric = metric + 1
+            print(f"[{self.node_id}] Reencaminhando ANNOUNCE (métrica={my_metric:.2f}ms)")
+        
+            # Cria ANNOUNCE com a métrica TOTAL até este nó
             forward_msg = create_announce_message(
-                flow_id, origin, new_metric, msg_id
+                flow_id=flow_id,
+                from_node=origin,      # Mantém origem original
+                metric=my_metric,      # ← Métrica total até aqui
+                msg_id=msg_id          # Mantém ID (evita loops)
             )
             
+            # Envia para todos os vizinhos EXCETO de onde veio
             with self.neighbors_lock:
                 neighbors_copy = dict(self.neighbors)
             
+            sent_count = 0
             for neighbor_id, sock in neighbors_copy.items():
-                if neighbor_id != from_node:
+                if neighbor_id != from_node:  # NÃO envia de volta
                     try:
                         send_message(sock, forward_msg)
-                    except:
-                        pass
+                        sent_count += 1
+                    except Exception as e:
+                        print(f"[{self.node_id}] Erro ao enviar para {neighbor_id}: {e}")
+            
+            if sent_count > 0:
+                print(f"[{self.node_id}]   → Encaminhado para {sent_count} vizinho(s)")
+
     
     def _handle_activate(self, msg: Message, from_node: str):
         """Processa ACTIVATE"""
@@ -516,6 +719,41 @@ class OverlayNode:
                     except:
                         pass
     
+    def _handle_latency_ping(self, msg: Message, conn: socket.socket, 
+                            from_neighbor: str):
+        """
+        Processa LATENCY_PING e responde com PONG imediatamente
+        """
+        ping_id = msg.data['ping_id']
+        original_timestamp = msg.data['timestamp']
+        
+        # Responde imediatamente com PONG
+        try:
+            pong = create_latency_pong_message(
+                from_node=self.node_id,
+                ping_id=ping_id,
+                original_timestamp=original_timestamp
+            )
+            send_message(conn, pong)
+        except Exception as e:
+            pass  # Silencioso
+    
+    def _handle_latency_pong(self, msg: Message, from_neighbor: str):
+        """
+        Processa LATENCY_PONG e atualiza monitor
+        """
+        ping_id = msg.data['ping_id']
+        original_timestamp = msg.data['original_timestamp']
+        
+        # Processa no monitor
+        rtt_ms = self.latency_monitor.process_pong(
+            from_neighbor, ping_id, original_timestamp
+        )
+        
+        # Debug (opcional, comentar para produção)
+        # if rtt_ms:
+        #     print(f"[LATENCY] {from_neighbor}: {rtt_ms:.2f}ms")
+
     def _handle_ping(self, msg: Message, from_node: str):
         """Processa PING"""
         path = msg.data.get('path', [])
@@ -560,9 +798,43 @@ class OverlayNode:
                     send_message(sock, msg)
                 except:
                     pass
-    
+
+    def _latency_ping_thread(self):
+        """
+        Thread que envia LATENCY_PING para todos os vizinhos
+        periodicamente para medir RTT
+        """
+        print(f"[{self.node_id}] Thread de latência iniciada")
+        
+        while self.running:
+            time.sleep(2.0)  # A cada 2 segundos
+            
+            # Cleanup de timeouts
+            self.latency_monitor.cleanup_timeouts()
+            
+            # Envia PING para todos os vizinhos
+            with self.neighbors_lock:
+                neighbors_copy = dict(self.neighbors)
+            
+            for neighbor_id, sock in neighbors_copy.items():
+                try:
+                    # Cria PING
+                    ping_id, timestamp = self.latency_monitor.create_ping_message(neighbor_id)
+                    
+                    # Envia
+                    msg = create_latency_ping_message(
+                        from_node=self.node_id,
+                        ping_id=ping_id,
+                        timestamp=timestamp
+                    )
+                    send_message(sock, msg)
+                    
+                except Exception as e:
+                    # Silencioso para não spammar
+                    pass
+
     def _stats_thread(self):
-        """Imprime estatísticas"""
+        """Imprime estatísticas periodicamente"""
         while self.running:
             time.sleep(30)
             with self.neighbors_lock:
@@ -570,6 +842,7 @@ class OverlayNode:
             print(f"\n[{self.node_id}] === STATUS ===")
             print(f"  Vizinhos conectados: {neighbor_list}")
             print(f"  Rotas: {self.routing_table.get_stats()}")
+            self.latency_monitor.print_stats()
             self.routing_table.print_table()
 
 
